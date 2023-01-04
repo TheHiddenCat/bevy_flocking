@@ -1,4 +1,11 @@
-use bevy::{prelude::*, time::FixedTimestep, render::camera::RenderTarget};
+use std::f32::consts::PI;
+
+use bevy::{
+    prelude::*, 
+    time::FixedTimestep, 
+    render::camera::RenderTarget,
+    tasks::available_parallelism,
+};
 
 use rand::prelude::*;
 
@@ -43,9 +50,7 @@ fn main() {
         .add_system_set(
             SystemSet::new()
                 .with_run_criteria(FixedTimestep::step(PHYSICS_STEP as f64))
-                .with_system(cohesion_system)
-                .with_system(seperation_system)
-                .with_system(alignment_system)
+                .with_system(flock_system)
                 .with_system(movement_system)
                 .with_system(wrapping_system)
         )
@@ -53,9 +58,9 @@ fn main() {
             SystemSet::new()
                 .with_run_criteria(FixedTimestep::step(ANIMATE_STEP as f64))
                 .with_system(sprite_animate_system)
+                .with_system(sprite_flip_x_system)
+                .with_system(sprite_z_layer_system)
         )
-        .add_system(sprite_flip_x_system)
-        .add_system(sprite_z_layer_system)
         .add_system(bevy::window::close_on_esc)
         .run();
 }
@@ -82,8 +87,7 @@ struct BirdConfiguration {
 fn spawn_camera(
     mut commands: Commands
 ) {
-    commands.spawn(Camera2dBundle::default())
-        .insert(Name::new("Camera"));
+    commands.spawn(Camera2dBundle::default()).insert(Name::new("Camera"));
 }
 
 fn spawn_birds(
@@ -107,29 +111,24 @@ fn spawn_birds(
     }
 
     let mut rng = thread_rng();
+
     for _ in 0..configuration.birds_amount {
         let texture_atlas = atlas_handles[rng.gen_range(0..=2)].clone();
+        let angle = rng.gen_range(0.0..PI*2.0);
+        let velocity = Vec2::new(angle.cos(), angle.sin()) * configuration.speed;
+        let position = Vec3::new(rng.gen_range(-width..=width), rng.gen_range(-height..=height), 1.0);
+        let index = rng.gen_range(0..=2);
+
         commands.spawn(SpriteSheetBundle {
                 texture_atlas,
                 sprite: TextureAtlasSprite {
-                    index: rng.gen_range(0..=2),
+                    index,
                     ..default()
                 },
-                transform: Transform::from_translation(
-                    Vec3::new(
-                        rng.gen_range(-width..=width), 
-                        rng.gen_range(-height..=height),
-                        1.0,
-                    )
-                ),
+                transform: Transform::from_translation(position),
                 ..default()
             })
-            .insert(Velocity(
-                Vec2::new(
-                    rng.gen_range(-1.0..=1.0), 
-                    rng.gen_range(-1.0..=1.0)
-                )
-            ))
+            .insert(Velocity(velocity))
             .insert(Bird)
             .insert(Name::new("Bird"));
     }
@@ -209,94 +208,7 @@ fn wrapping_system(
     }
 }
 
-fn cohesion_system(
-    configuration: Res<BirdConfiguration>,
-    mut query: Query<(Entity, &Transform, &mut Velocity), With<Bird>>
-) {
-    let birds = query
-        .into_iter()
-        .map(|(entity, transform, _)| (entity.index(), transform.translation.truncate()) )
-        .collect::<Vec<(u32, Vec2)>>();
-
-    for (entity, transform, mut velocity) in query.iter_mut() {
-        let mut count = 0;
-        let mut sum = Vec2::ZERO;
-
-        for (other_entity, other_position) in birds.iter() {
-            if other_entity == &entity.index() {
-                continue;
-            }
-
-            let distance = transform.translation.truncate().distance(*other_position);
-
-            if distance < configuration.neighbour_radius {
-                sum += *other_position;
-                count += 1;
-            }
-        }
-
-        if count > 0 {
-            sum /= count as f32;
-            let mut desired = sum - transform.translation.truncate();
-            desired = desired.normalize();
-            desired *= configuration.speed;
-
-            let mut steer = desired - velocity.0;
-            if steer.length() > configuration.steer {
-                steer = steer.normalize() * configuration.steer;
-            }
-
-            velocity.0 += steer * configuration.cohesion;
-        }
-    }
-}
-
-fn seperation_system(
-    configuration: Res<BirdConfiguration>,
-    mut query: Query<(Entity, &Transform, &mut Velocity), With<Bird>>
-) {
-    let birds = query
-        .into_iter()
-        .map(|(entity, transform, _)| (entity.index(), transform.translation.truncate()) )
-        .collect::<Vec<(u32, Vec2)>>();
-
-    for (entity, transform, mut velocity) in query.iter_mut() {
-        let mut count = 0;
-        let mut sum = Vec2::ZERO;
-
-        for (other_entity, other_position) in birds.iter() {
-            if other_entity == &entity.index() {
-                continue;
-            }
-            let position = transform.translation.truncate();
-            let distance = position.distance(*other_position);
-
-            if distance < configuration.seperation_radius {
-                let mut difference = position - *other_position;
-                difference = difference.normalize();
-                difference /= distance;
-                sum += difference;
-                count += 1;
-            }
-        }
-
-        if count > 0 {
-            sum /= count as f32;
-        }
-
-        if sum.length() > 0.0 {
-            sum = sum.normalize();
-            sum *= configuration.speed;
-            sum -= velocity.0;
-            if sum.length() > configuration.steer {
-                sum = sum.normalize() * configuration.steer;
-            }
-            velocity.0 += sum * configuration.seperation;
-        }
-    }
-}
-
-fn alignment_system(
+fn flock_system(
     configuration: Res<BirdConfiguration>,
     mut query: Query<(Entity, &Transform, &mut Velocity), With<Bird>>
 ) {
@@ -305,34 +217,66 @@ fn alignment_system(
         .map(|(entity, transform, velocity)| (entity.index(), transform.translation.truncate(), velocity.0) )
         .collect::<Vec<(u32, Vec2, Vec2)>>();
 
-    for (entity, transform, mut velocity) in query.iter_mut() {
+    query.par_for_each_mut(available_parallelism(), |(entity, transform, mut velocity)| {
         let mut count = 0;
-        let mut sum = Vec2::ZERO;
+        let mut too_close = 0;
+        let mut cohesion = Vec2::ZERO;
+        let mut alignment = Vec2::ZERO;
+        let mut seperation = Vec2::ZERO;
+
+        let position = transform.translation.truncate();
 
         for (other_entity, other_position, other_velocity) in birds.iter() {
             if other_entity == &entity.index() {
                 continue;
             }
-            let position = transform.translation.truncate();
             let distance = position.distance(*other_position);
-
             if distance < configuration.neighbour_radius {
-                sum += *other_velocity;
+                cohesion += *other_position;
+                alignment += *other_velocity;
                 count += 1;
+            }
+
+            if distance < configuration.seperation_radius {
+                let mut difference = position - *other_position;
+                difference = difference.normalize() / distance;
+                seperation += difference;
+                too_close += 1;
             }
         }
 
         if count > 0 {
-            sum /= count as f32;
-            sum = sum.normalize();
-            sum *= configuration.speed;
-
-            let mut steer = sum - velocity.0;
-            if steer.length() > configuration.steer {
-                steer = steer.normalize() * configuration.steer;
+            cohesion /= count as f32;
+            cohesion -= position;
+            cohesion = cohesion.normalize() * configuration.speed;
+            cohesion -= velocity.0;
+            if cohesion.length() > configuration.steer {
+                cohesion = cohesion.normalize() * configuration.steer;
             }
+            cohesion *= configuration.cohesion;
 
-            velocity.0 += steer * configuration.alignment;
+            alignment /= count as f32;
+            alignment = alignment.normalize() * configuration.speed;
+            alignment -= velocity.0;
+            if alignment.length() > configuration.steer {
+                alignment = alignment.normalize() * configuration.steer;
+            }
+            alignment *= configuration.alignment;
         }
-    }
+
+        if too_close > 0 {
+            seperation /= too_close as f32;
+        }
+
+        if seperation.length() > 0.0 {
+            seperation = seperation.normalize() * configuration.speed;
+            seperation -= velocity.0;
+            if seperation.length() > configuration.steer {
+                seperation = seperation.normalize() * configuration.steer;
+            }
+            seperation *= configuration.seperation;
+        }
+
+        velocity.0 += cohesion + alignment + seperation;
+    });
 }
